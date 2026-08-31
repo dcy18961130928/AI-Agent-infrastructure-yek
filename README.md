@@ -5,7 +5,7 @@ A personal AI Agent infrastructure with persistent memory, mobile bridge, voice 
 
 一套全栈 AI 基础设施，解决大语言模型在实际使用中的四个核心局限：**跨会话失忆、交互方式单一、完全被动响应、AI Agent只能桌面访问**。
 
-面向学生、职场人士、知识工作者等需要长期与 AI 协作的用户，历时 3 个多月持续设计与迭代，现已完整部署并稳定运行。
+面向生活、学习、工作等需要长期与 AI 协作的用户，历时 3 个多月持续设计与迭代，现已完整部署并稳定运行。
 
 ---
 
