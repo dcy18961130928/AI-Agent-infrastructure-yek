@@ -11,16 +11,16 @@ A personal AI Agent infrastructure with persistent memory, mobile bridge, voice 
 
 ## 为什么做这个
 
-当前 AI 助手存在四个结构性问题：
+与 AI 助手一起做长期项目时，有四个问题始终没有被好好解决：
 
 | 问题 | 实际影响 |
 |------|---------|
-| 会话之间无记忆 | 每次对话从零开始，项目背景、用户偏好全部丢失 |
+| 会话之间无记忆 | 每次对话从零开始，项目背景、偏好、上下文全部丢失 |
 | 只有文字交互 | 打字输入效率低，缺乏个性化与在场感 |
 | 完全被动 | 用户不开口 AI 就停止，无法在用户忙碌时继续工作 |
 | 只能桌面访问 | 移动端无法便捷调度 AI Agent，与实际工作场景脱节 |
 
-本系统的每个模块，针对其中一个问题。
+这个项目从这四个问题出发，逐一设计方案并落地。
 
 ---
 
@@ -30,7 +30,7 @@ A personal AI Agent infrastructure with persistent memory, mobile bridge, voice 
 ┌───────────────────── VPS 服务器 (Ubuntu 24.04) ──────────────────────┐
 │                                                                       │
 │  memory-server :3001    bridge-server :3002    chat-server :3003     │
-│  speak-mcp :3005        Nginx（反向代理 + HTTPS）                      │
+│  call-controller :3010  speak-mcp :3005        Nginx（反向代理 + HTTPS）│
 │                                                                       │
 │  静态页面：/bridge    /hear    /fortune                                │
 └────────────────────────────────┬──────────────────────────────────────┘
@@ -48,7 +48,7 @@ A personal AI Agent infrastructure with persistent memory, mobile bridge, voice 
 ```
 
 
-**技术栈**
+## 技术栈
 
 | 层级 | 技术 |
 |------|------|
@@ -56,13 +56,13 @@ A personal AI Agent infrastructure with persistent memory, mobile bridge, voice 
 | 数据库 | SQLite（better-sqlite3） |
 | 通信协议 | WebSocket、SSE、REST API |
 | AI 集成 | MCP（Model Context Protocol）、Claude API |
-| 语音 | ElevenLabs TTS、Web Speech API |
+| 语音 | ElevenLabs TTS（eleven_v3）、Groq Whisper ASR、Web Speech API |
 | 自动化 | Playwright、Windows 任务计划程序 |
-| 部署 | PM2、Nginx、Systemd |
+| 部署 | PM2、Nginx、Systemd（Ubuntu 24.04） |
 
 ---
 
-## 模块详解
+## 核心模块
 
 ### 1. 多层持久记忆系统
 
@@ -112,37 +112,36 @@ VPS 中继服务器  ← 处理认证、路由、断线重连
 
 **关键设计决策**：
 - 中继部署在 VPS——本地机器无需暴露在公网，无需开放端口或配置动态 DNS
-- 手机消息以 MCP tool result 形式送达 Claude Code——移动端消息与其他工具输入完全同等对待，Claude 无需任何特殊适配
+- 手机消息以 MCP tool result 形式送达 Claude Code，移动端消息与其他工具输入完全同等对待，Claude 无需任何特殊适配
 - VPS 中继维护 clientId 映射——支持多设备同时连接时的精准回包路由
 
-**前端**：手机端 PWA，可安装至 iOS/Android 主屏幕，实时渲染 AI 思考链，支持语音条播放与图片附件。
+**前端**：手机端 PWA，可安装至 iOS/Android 主屏幕，实时渲染 AI 思考链，支持语音条播放、图片附件。
 
 ---
 
 ### 3. 语音交互系统
 
-**问题**：纯文字输入在移动端效率低，且无法满足用户对 AI 个性化体验日益增长的需求——当前 AI 产品趋向「私人定制」，千篇一律的机器音已不够用。
+**问题**：纯文字交互效率有限；缺少真正的实时通话场景。
 
-**双向设计**：
+**三层设计**：
 
 #### Speak（AI → 用户）
-
-用户可为 AI 定制专属音色（语气、音调、节奏），生成与个人需求高度匹配的语音回复：
-
-- 通过 ElevenLabs 克隆/定制音色（eleven_v3 pipeline），可精细调整语气与风格
-- 独立 `speak-mcp` server（port 3005）按需生成 MP3 并持久化存储，每条语音有永久 URL
-- 三种下发渠道：
-  - **Bridge 语音条**：手机端 PWA 内嵌播放器，对话流中直接播放
-  - **claude.ai 内嵌播放器**：通过 MCP connector 在 Web UI 内渲染，无需跳转
-  - **独立播放页**：生成唯一永久链接，可分享或存档
-
-**关键设计决策**：`speak-mcp` 作为独立进程运行而非内嵌主服务器——Claude Code（本地）与 claude.ai（云端）可同时连接同一 TTS 服务，互不干扰，无共享状态冲突。类比微服务架构的无状态服务单独部署。
+- ElevenLabs 定制专属音色（eleven_v3），emotion tag 精确控制语气
+- 独立 `speak-mcp` 微服务，无状态操作，Claude Code 与 claude.ai 可同时连接同一 TTS 服务
+- 三种下发渠道：手机端 PWA 内嵌播放条 / claude.ai 内嵌播放器 / 永久独立播放页
 
 #### Hear（用户 → AI）
+- Web Speech API 实时转写，无需上传音频，隐私可控
+- 转写文本附带时间戳元数据送达 AI
 
-- 手机端录音界面（`/hear/` 页面），适合不方便打字的场景
-- Web Speech API 实时转写，无需上传音频文件，隐私更可控
-- 转写文本经 voice note 接口送达 AI，附带时间戳等元数据
+#### Call（双向实时通话）
+- 数据流：手机录音 → VAD 切割 → Groq Whisper ASR（+ voiceTone 情绪感知）→ 逐字稿经 bridge → AI 回复 → ElevenLabs v3 TTS → 手机端播放
+- 独立 Call Controller 微服务（port 3010），与主服务器完全解耦
+- 通话界面：全屏 Overlay，磨砂玻璃质感，头像光圈动画，实时滚动记录，衬线体计时器
+- iOS 兼容处理：AudioContext 手势帧 resume / TTS catch 防状态机卡死
+- 通话结束自动保存逐字稿，bridge 内可查看历史
+
+**关键设计决策（Call）**：通话路由至当前 AI 实例（通过 bridge），而非另起独立 API 实例，打来的电话接在正在运行的 AI 会话里，保留完整上下文，人机交互自然。
 
 ---
 
@@ -221,14 +220,14 @@ VPS 中继服务器  ← 处理认证、路由、断线重连
 
 ---
 
-## 系统成果
+## 系统现状
 
 | 指标 | 数据 |
 |------|------|
-| 持续运行时长 | 3 个月以上 |
+| 持续运行时长 | 4 个月以上 |
 | 记忆库条目 | 500+ 条，跨多个分层 |
-| 功能模块 | 7 个主要系统 |
-| 接入平台 | 桌面端（Claude Code）、手机端（PWA）、Web/APP 端（claude.ai） |
+| 核心功能模块 | 7 个 |
+| 接入平台 | 桌面端（Claude Code）、手机端（PWA）、Web 端（claude.ai） |
 | 自定义 MCP 工具 | 15+ 个，分布在 4 个独立 MCP server |
 
 ---
@@ -247,5 +246,6 @@ VPS 中继服务器  ← 处理认证、路由、断线重连
 VPS 端（/home/）
 ├── memory-server/       ← 记忆系统（REST API + MCP endpoint）
 ├── chat-server/         ← Bridge HTTP + 语音笔记接口 + Web Push
+├── call-controller/     ← 实时通话服务（Groq ASR + ElevenLabs TTS，port 3010）
 └── speak-mcp/           ← TTS 生成服务（port 3005，独立常驻）
 ```
