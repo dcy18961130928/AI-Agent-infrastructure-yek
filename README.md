@@ -1,5 +1,260 @@
 # AI-Agent-infrastructure-yek
+
 A personal AI Agent infrastructure with persistent memory, mobile bridge, voice interaction, and autonomous task scheduling.
+
+Built over 4+ months to solve four structural limitations of LLM-based AI assistants in real-world use: **cross-session memory loss, limited interaction modalities, fully passive responsiveness, and desktop-only access**.
+
+---
+
+## Why I Built This
+
+When working with AI assistants on long-term projects, four problems kept getting in the way:
+
+| Problem | Real Impact |
+|---------|-------------|
+| No memory across sessions | Every conversation starts from zero — project context, preferences, history all lost |
+| Text-only interaction | Low input efficiency; lacks personalization and presence |
+| Fully passive | AI stops working the moment you go offline; no background task execution |
+| Desktop-only access | Can't dispatch AI Agent tasks on mobile; breaks real-world workflows |
+
+This project addresses each problem with a concrete design decision and a deployed solution.
+
+---
+
+## System Architecture
+
+```
+┌───────────────────── VPS (Ubuntu 24.04) ─────────────────────┐
+│                                                                │
+│  memory-server :3001    bridge-server :3002    chat-server :3003  │
+│  call-controller :3010  speak-mcp :3005        Nginx (reverse proxy + HTTPS)  │
+│                                                                │
+│  Static pages: /bridge    /hear    /fortune                   │
+└───────────────────────────┬────────────────────────────────────┘
+                            │ WebSocket / HTTPS
+         ┌──────────────────┼──────────────────┐
+         │                  │                   │
+   Mobile PWA          Local machine        claude.ai
+  (mobile bridge)  ┌───────────────────┐  (MCP connector)
+                   │  server.ts (Bun)   │
+                   │  wakeup.cjs        │
+                   │  xhs_mcp.py        │
+                   └───────────────────┘
+                             │
+                   Claude Code (local CLI)
+```
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|------------|
+| Runtime | Node.js, Bun, Python |
+| Database | SQLite (better-sqlite3) |
+| Protocols | WebSocket, SSE, REST API |
+| AI Integration | MCP (Model Context Protocol), Claude API |
+| Voice | ElevenLabs TTS (eleven_v3), Groq Whisper ASR, Web Speech API |
+| Automation | Playwright, OS task scheduler |
+| Deployment | PM2, Nginx, Systemd (Ubuntu 24.04) |
+
+---
+
+## Core Modules
+
+### 1. Multi-layer Persistent Memory System
+
+**Problem:** LLMs have no cross-session memory. Project context, user preferences, and conversation history all reset on window close. Storing everything in external tools like Notion enables persistence, but requires full-load retrieval — linear token cost growth with no selective filtering.
+
+**Solution:** A layered database organized by content type and retention policy, supporting precise retrieval by layer and time window:
+
+| Layer | Example Use | Retention |
+|-------|-------------|-----------|
+| `core` | User preferences, global project rules | Permanent |
+| `journal` | Daily work logs, project notes | Permanent |
+| `moments` | Key decisions, critical snapshots | Permanent |
+| `plans` | Project plans, goals, task lists | Permanent |
+| `context` | Recent session summaries, current task state | Auto-archived after 72h |
+| `health` | State tracking (health data, workload monitoring) | Permanent |
+| `knowledge` | Domain knowledge bases, research accumulation | Permanent |
+
+**Key design decisions:**
+- `context` layer auto-expires after 72h — short-term state should not accumulate as permanent context noise
+- New sessions load specific layers on-demand rather than full-load — eliminates the token waste of "read everything" approaches
+- Bilingual content storage — supports both Chinese and English interactions; forward-compatible with embedding retrieval
+
+**Tech:** Express REST API + SQLite, exposed as MCP endpoint (JSON-RPC 2.0 + SSE transport), supporting both Claude Code and claude.ai read/write.
+
+---
+
+### 2. Mobile Real-time Communication Bridge
+
+**Problem:** Claude Code and similar agents are desktop-only. Users on commutes or away from their computers cannot dispatch tasks to AI Agents or check progress — mobile collaboration is completely broken.
+
+**Solution:** Three-tier WebSocket relay architecture, solving NAT traversal between mobile clients and local Claude Code:
+
+```
+Mobile browser (PWA)
+    ↕  WebSocket (consumer role)
+VPS relay server  ← handles auth, routing, reconnection
+    ↕  WebSocket (provider role)
+Local Claude Code (MCP server)
+```
+
+Local MCP server (`server.ts`, Bun runtime) connects to VPS as provider; mobile connects as consumer with token auth, bidirectional routing, and automatic heartbeat/reconnection.
+
+**Use cases:**
+- Dispatch new tasks to AI Agent during commute
+- Check progress of ongoing AI background work after leaving the computer
+- Trigger document organization, research, and other background tasks remotely
+
+**Key design decisions:**
+- Relay on VPS — local machine never exposed to public internet, no port forwarding or dynamic DNS needed
+- Mobile messages delivered as MCP tool results — treated identically to any other tool input, no special Claude adaptation needed
+- VPS relay maintains `clientId` mapping — supports precise response routing when multiple devices are connected simultaneously
+
+**Frontend:** Mobile PWA, installable to iOS/Android home screen; renders AI thinking chain in real time, supports voice playback and image attachments.
+
+---
+
+### 3. Voice Interaction System
+
+**Problem:** Text-only interaction has efficiency limits on mobile; no real-time two-way voice conversation support; generic AI voices lack personalization.
+
+**Three-layer design:**
+
+#### Speak (AI → User)
+- ElevenLabs custom voice (eleven_v3), emotion tags for precise tone control
+- Independent `speak-mcp` microservice, stateless; Claude Code and claude.ai can call the same TTS service concurrently
+- Three delivery channels: mobile PWA inline audio bar / claude.ai inline player / persistent standalone playback page
+
+#### Hear (User → AI)
+- Web Speech API real-time transcription — no audio upload, privacy-preserving
+- Transcribed text with timestamp metadata delivered to AI
+
+#### Call (Bidirectional Real-time)
+- Pipeline: phone mic → VAD → Groq Whisper ASR (+ voiceTone emotion sensing) → transcript via bridge → AI reply → ElevenLabs v3 TTS → phone playback
+- Independent Call Controller microservice (port 3010), fully decoupled from main server
+- Call UI: full-screen overlay, frosted glass aesthetic, avatar glow animation, live scrolling transcript, serif timer
+- iOS compatibility: AudioContext gesture-frame resume / TTS catch to prevent state machine deadlock
+- Call records automatically saved at end of session; viewable in bridge history
+
+**Key design decision (Call):** Calls are routed to the current AI instance via bridge — not a separate API instance. Incoming calls land in the running AI session, preserving full context for natural conversation.
+
+---
+
+### 4. Autonomous Wakeup & Background Task System
+
+**Problem:** AI Agents are fully reactive — they stop working the moment the user goes offline. No background task execution during meetings, sleep, or away time. Long idle periods expire the API cache, requiring costly context reloads on next session.
+
+**Solution:** Probabilistic scheduled wakeup system balancing background task execution and cache maintenance:
+
+- OS task scheduler triggers wakeup at configurable intervals
+- Trigger probability dynamically adjustable by time-of-day (e.g., higher during working hours)
+- **Both probability and interval pulled from remote VPS config** — adjustable as product parameters without redeploying local scripts
+- On wakeup: optionally pulls real-time wearable health data (heart rate, step count) and injects as context
+- Woken Claude session can autonomously read/write memory, execute pending tasks, and send push notifications
+
+**Three core values:**
+
+1. **Background task execution:** AI continues working while user is offline; task results ready when user returns
+2. **Scheduled task dispatch:** Set recurring reminders, periodic information summaries, scheduled report generation
+3. **Cache maintenance cost reduction:** Anthropic API supports up to 1-hour prompt cache TTL; setting wakeup interval slightly below TTL (e.g., 55 min) keeps cache warm throughout long-running sessions — significant token cost savings for heavy users
+
+---
+
+### 5. Browser Automation MCP
+
+**Problem:** AI can only passively process information the user explicitly brings — limiting AI Agent effectiveness for information-intensive tasks.
+
+**Solution:** Playwright-based browser automation registered as Claude Code MCP tools:
+
+- Cookie/session file persistence for authenticated login state
+- Four MCP tools: `browse`, `search`, `profile`, `feed`
+- DOM-based content extraction with multiple fallback strategies for dynamic content
+- Runs locally — avoids VPS IP triggering platform bot detection
+
+**Use cases:**
+- **User research:** Auto-scrape target platform comments and feedback posts; AI summarizes and analyzes
+- **Competitor monitoring:** Periodically browse competitor updates; AI compiles change summaries
+- **Content aggregation:** Collect industry news from multiple sources; AI filters and surfaces relevant items
+
+**Key design decision:** Local execution shares the user's login session and geolocation, bypassing bot detection. MCP interface abstracts all Playwright complexity — from AI's perspective, browsing a webpage is identical to calling any other tool.
+
+---
+
+### 6. Web Push Notification System
+
+**Problem:** AI Agent work results are only visible when the user actively opens the app — ineffective for parallel task awareness.
+
+**Solution:** Complete Web Push pipeline for proactive task-completion notifications:
+
+- VPS manages push subscriptions (VAPID key pair + subscription storage)
+- AI calls `push_notify` MCP tool → POST to chat-server → VAPID-signed push → phone system notification → home screen alert
+- Delivers regardless of whether the app is in foreground, background, or screen locked
+
+**Use case:** AI Agent running multiple parallel tasks (document organization, research, code review) — each completion triggers a notification. User stays focused on other work without monitoring progress.
+
+**Key design decision:** Push encapsulated as a single MCP tool call (`push_notify(text="...")`). AI doesn't need to understand the push delivery chain — sending a notification is as simple as calling any other tool.
+
+---
+
+### 7. Semantic Memory Retrieval Engine
+
+**Problem:** As memory entries grow, pure keyword search fails to surface records with deep thematic or contextual connections — the relevant past discussion may use completely different phrasing.
+
+**Solution:** LLM-driven semantic pattern recognition:
+
+On-demand reads across multiple memory layers; an independent LLM instance identifies historically resonant records based on semantic or contextual patterns relative to the current conversation. Returns top-3 results with reasoning.
+
+**Three tools:**
+- `recall_memory(context)` — semantic pattern-based recall, not keyword matching
+- `enrich_memory(limit)` — batch-complete missing metadata (titles, tags, multilingual content)
+- `retrospective(year, month)` — generate a monthly narrative retrospective across multiple memory layers
+
+**Key design decision:** LLM over embedding — embedding optimizes for similarity, but the goal here is contextual resonance. Two records with zero lexical overlap may be discussing the same type of decision problem.
+
+---
+
+## Current Status
+
+| Metric | Value |
+|--------|-------|
+| Runtime | 4+ months continuous |
+| Memory entries | 500+, across multiple layers |
+| Core modules | 7 |
+| Platforms | Desktop (Claude Code), Mobile (PWA), Web (claude.ai) |
+| Custom MCP tools | 15+, across 4 independent MCP servers |
+
+---
+
+## How It Was Built
+
+This project was developed collaboratively with Claude (sonnet 4.6 / fable 5) throughout — from problem identification and architecture design to module-by-module debugging and deployment. Product decisions and requirements were driven by me; architecture and implementation were iteratively refined through ongoing human-AI collaboration.
+
+This system grew from a very personal starting point: I wanted an AI that fit me as well as possible.
+Four months later, it became a complete AI infrastructure. Every module exists for a concrete, real reason.
+
+---
+
+## File Structure
+
+```
+Local
+├── server.ts            ← MCP channel server + bridge relay client (Bun)
+├── wakeup.cjs           ← Autonomous wakeup scheduler (task scheduler trigger)
+├── xhs_mcp.py           ← Browser automation MCP server (Playwright)
+└── bridge/
+    ├── relay-server.js  ← VPS-side WebSocket relay
+    └── index.html       ← Mobile chat PWA
+
+VPS (/home/)
+├── memory-server/       ← Memory system (REST API + MCP endpoint)
+├── chat-server/         ← Bridge HTTP + voice notes + Web Push
+├── call-controller/     ← Real-time call service (Groq ASR + ElevenLabs TTS, port 3010)
+└── speak-mcp/           ← TTS generation service (port 3005, standalone daemon)
+```
+
+---
+
 
 # 个人 AI Agent 基础设施系统
 
